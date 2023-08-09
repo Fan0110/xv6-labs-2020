@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -51,6 +53,13 @@ void kvminit()
 void kvminithart()
 {
   w_satp(MAKE_SATP(kernel_pagetable));
+  sfence_vma();
+}
+
+// Store kernel page table to SATP register
+void proc_inithart(pagetable_t kpt)
+{
+  w_satp(MAKE_SATP(kpt));
   sfence_vma();
 }
 
@@ -133,7 +142,7 @@ kvmpa(uint64 va)
   pte_t *pte;
   uint64 pa;
 
-  pte = walk(kernel_pagetable, va, 0);
+  pte = walk(myproc()->kernelpt, va, 0);
   if (pte == 0)
     panic("kvmpa");
   if ((*pte & PTE_V) == 0)
@@ -343,6 +352,34 @@ err:
   return -1;
 }
 
+// copy the user page table into its kernel page table from 'begin' to 'end'  - lab3-3
+int u2kvmcopy(pagetable_t upagetable, pagetable_t kernelpt, uint64 begin, uint64 end)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
+  uint64 begin_page = PGROUNDUP(begin); // 向上取整
+  for (i = begin_page; i < end; i += PGSIZE)
+  {
+    if ((pte = walk(upagetable, i, 0)) == 0)
+      panic("uvmcopy2kvm: pte should exist");
+    if ((*pte & PTE_V) == 0)
+      panic("uvmcopy2kvm: page not present");
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte) & (~PTE_U); // clear PTE_U flag
+    // map to the physical memory same as user's pa instead of kalloc()
+    if (mappages(kernelpt, i, PGSIZE, pa, flags) != 0)
+    {
+      goto err;
+    }
+  }
+  return 0;
+
+err:
+  uvmunmap(kernelpt, begin_page, (i - begin_page) / PGSIZE, 0);
+  return -1;
+}
+
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
 void uvmclear(pagetable_t pagetable, uint64 va)
@@ -385,24 +422,7 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-
-  while (len > 0)
-  {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -411,48 +431,7 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while (got_null == 0 && max > 0)
-  {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > max)
-      n = max;
-
-    char *p = (char *)(pa0 + (srcva - va0));
-    while (n > 0)
-    {
-      if (*p == '\0')
-      {
-        *dst = '\0';
-        got_null = 1;
-        break;
-      }
-      else
-      {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if (got_null)
-  {
-    return 0;
-  }
-  else
-  {
-    return -1;
-  }
+  return copyinstr_new(pagetable, dst, srcva, max);
 }
 
 /**
@@ -493,4 +472,30 @@ void vmprint(pagetable_t pagetable)
 {
   printf("page table %p\n", pagetable);
   _vmprint(pagetable, 1);
+}
+
+// Just follow the kvmmap on vm.c
+void uvmmap(pagetable_t pagetable, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  if (mappages(pagetable, va, sz, pa, perm) != 0)
+    panic("uvmmap");
+}
+
+// Create a kernel page table for the process
+pagetable_t
+proc_kpt_init()
+{
+  pagetable_t kernelpt = uvmcreate();
+
+  if (kernelpt == 0)
+    return 0;
+  uvmmap(kernelpt, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  uvmmap(kernelpt, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  // 这里需要注释，因为CLINT只有在内核启动时需要用到，且它在PLIC之下，会导致重复映射remap
+  // uvmmap(kernelpt, CLINT, CLINT, 0x10000, PTE_R | PTE_W);
+  uvmmap(kernelpt, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+  uvmmap(kernelpt, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+  uvmmap(kernelpt, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+  uvmmap(kernelpt, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  return kernelpt;
 }
